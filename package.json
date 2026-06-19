@@ -4,10 +4,14 @@
   "description": "Self-contained Node.js monitor that scans an endpoint for official PRIMARY/standard-retail tickets for Match 104 (The Final), applies strict purity + price filtering, and dispatches an email alert on a genuine drop.",
   "main": "app.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node app.js",
     "once": "node app.js --once",
-    "mock": "node mockServer.js"
+    "mock": "node mockServer.js",
+    "test": "node --test"
   },
   "keywords": [
     "ticket",

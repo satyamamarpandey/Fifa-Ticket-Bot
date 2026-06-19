@@ -1,27 +1,27 @@
 /**
  * mockServer.js
  * -----------------------------------------------------------------------------
- * A zero-dependency local sandbox that imitates the ticketing platform so the
- * monitor can be exercised end-to-end with NO external/live environment.
+ * Zero-dependency local sandbox imitating the ticketing platform so the monitor
+ * runs end-to-end with NO external/live environment. Uses Node's built-in
+ * `http` module (no Express).
  *
- * It uses Node's built-in `http` module (no Express needed) and exposes two
- * meaningful states:
+ * States:
+ *   GET /        quiet page — only resale / hospitality / wrong-match noise.
+ *   GET /drop    a genuine primary-retail drop: one valid Match 104 Category 2
+ *                seat at official face value, buried among decoys that each
+ *                exercise a different rejection rule.
+ *   GET /health  liveness probe -> {"status":"ok"}.
  *
- *   GET  /         -> a normal "quiet" page. Contains only sold-out / resale /
- *                     hospitality noise — i.e. NOTHING the monitor should alert
- *                     on. This is the steady-state the monitor sees 99% of time.
+ * Append ?format=json (or send Accept: application/json) to "/" or "/drop" to
+ * receive the same data as a structured API payload instead of HTML, so both
+ * parsing paths in app.js can be tested.
  *
- *   GET  /drop     -> simulates a genuine primary-retail drop. Contains ONE
- *                     valid "Primary / Standard Retail" Match 104 listing that
- *                     satisfies every rule, surrounded by decoy listings
- *                     (resale, hospitality, wrong match, over-priced "primary")
- *                     so you can prove the filters reject impostors.
+ * Prices reflect FIFA's published primary face values for the 2026 Final
+ * (Match 104, MetLife Stadium): Cat 1 $6,730+ (dynamic), Cat 2 $4,210,
+ * Cat 3 $2,790, Cat 4 $2,030. Resale runs $8,000+. A 15% service fee applies
+ * at checkout (modelled by the monitor, not added here).
  *
- * Both routes also support a structured-API mode: append `?format=json` (or send
- * `Accept: application/json`) and the same data is returned as a JSON payload
- * instead of HTML. This lets you test BOTH parsing paths in app.js.
- *
- * Run:  node mockServer.js          (reads MOCK_PORT from .env, default 4040)
+ * Run:  node mockServer.js     (reads MOCK_PORT from .env, default 4040)
  * -----------------------------------------------------------------------------
  */
 
@@ -32,130 +32,140 @@ const http = require('http');
 const { URL } = require('url');
 
 const PORT = Number(process.env.MOCK_PORT) || 4040;
+const CHECKOUT_URL = `http://localhost:${PORT}/checkout/match104-final-cat2-A17`;
 
-// A stable, direct checkout link the alert email will point at.
-const CHECKOUT_URL =
-  'http://localhost:' + PORT + '/checkout/match104-final-primary-A17';
-
-/**
- * Canonical listing objects. Each is described once as data, then rendered
- * either as HTML or JSON depending on the request. `flags` carries the impurity
- * markers the monitor must screen for.
- */
+// Canonical listings (described once; rendered as HTML or JSON on demand).
 const LISTINGS = {
-  // ---- The ONE listing that should pass every rule -------------------------
+  // The ONE seat that should pass every rule: primary, Category 2, face value.
   validPrimary: {
     id: 'L-VALID-104',
     matchId: '104',
     matchName: 'The Final',
-    category: 'Primary / Standard Retail',
-    price: 4150, // inside the [3800, 4200] base band AND under the 4200 cap
+    saleType: 'Primary',
+    category: 'Category 2',
+    price: 4210, // official Cat 2 face value, within ±5% band and under cap
     currency: 'USD',
-    flags: [], // pure: no resale / hospitality markers
+    flags: [],
     url: CHECKOUT_URL,
-    label: 'Match 104 — The Final · Category 1 (Primary / Standard Retail)'
+    label: 'Match 104 — The Final · Category 2 (Primary)'
   },
 
-  // ---- Decoys that MUST be rejected ---------------------------------------
-  // Right match + category, but flagged as resale -> impure.
+  // Decoys — each must be rejected for a DIFFERENT reason.
+
+  // Resale of a Cat 1 seat -> rejected by sale-type / impurity marker.
   resaleDecoy: {
     id: 'L-RESALE-104',
     matchId: '104',
     matchName: 'The Final',
-    category: 'Primary / Standard Retail',
-    price: 4100,
+    saleType: 'Verified Fan Resale',
+    category: 'Category 1',
+    price: 8200,
     currency: 'USD',
-    flags: ['verified fan resale'],
-    url: 'http://localhost:' + PORT + '/checkout/resale-xyz',
+    flags: ['resale'],
+    url: `http://localhost:${PORT}/checkout/resale-xyz`,
     label: 'Match 104 — The Final · Verified Fan Resale'
   },
 
-  // Right match, but hospitality package -> impure.
+  // Hospitality package -> rejected by sale-type / impurity marker.
   hospitalityDecoy: {
     id: 'L-HOSP-104',
     matchId: '104',
     matchName: 'The Final',
-    category: 'Hospitality',
-    price: 4000,
+    saleType: 'Hospitality',
+    category: 'Hospitality Suite',
+    price: 12000,
     currency: 'USD',
     flags: ['hospitality'],
-    url: 'http://localhost:' + PORT + '/checkout/hosp-pkg',
+    url: `http://localhost:${PORT}/checkout/hosp-pkg`,
     label: 'Match 104 — The Final · Hospitality Suite'
   },
 
-  // Claims to be primary, but priced FAR outside the official base band ->
-  // treated as a mis-flagged resale and discarded by the deviation check.
+  // Labelled "Primary" but priced like a resale -> rejected by base-rate
+  // deviation AND budget cap (a mis-flagged resale).
   overpricedPrimaryDecoy: {
     id: 'L-OVERPRICE-104',
     matchId: '104',
     matchName: 'The Final',
-    category: 'Primary / Standard Retail',
-    price: 9800, // way above PRIMARY_BASE_MAX and the price cap
+    saleType: 'Primary',
+    category: 'Category 2',
+    price: 9800,
     currency: 'USD',
     flags: [],
-    url: 'http://localhost:' + PORT + '/checkout/primary-overpriced',
-    label: 'Match 104 — The Final · "Primary" (suspicious price)'
+    url: `http://localhost:${PORT}/checkout/primary-overpriced`,
+    label: 'Match 104 — The Final · "Primary" Cat 2 (suspicious price)'
   },
 
-  // A perfectly valid primary ticket, but for the WRONG match -> ignored.
+  // Legit primary Cat 1 but above the budget cap -> rejected by cap.
+  cat1OverCapDecoy: {
+    id: 'L-CAT1-104',
+    matchId: '104',
+    matchName: 'The Final',
+    saleType: 'Primary',
+    category: 'Category 1',
+    price: 6730,
+    currency: 'USD',
+    flags: [],
+    url: `http://localhost:${PORT}/checkout/cat1`,
+    label: 'Match 104 — The Final · Category 1 (over budget)'
+  },
+
+  // Perfectly valid primary, but the WRONG match -> ignored.
   wrongMatchDecoy: {
     id: 'L-PRIMARY-087',
     matchId: '87',
     matchName: 'Semi-Final 2',
-    category: 'Primary / Standard Retail',
+    saleType: 'Primary',
+    category: 'Category 2',
     price: 2200,
     currency: 'USD',
     flags: [],
-    url: 'http://localhost:' + PORT + '/checkout/semifinal',
-    label: 'Match 87 — Semi-Final 2 · Primary / Standard Retail'
+    url: `http://localhost:${PORT}/checkout/semifinal`,
+    label: 'Match 87 — Semi-Final 2 · Category 2 (Primary)'
   }
 };
 
-// What each route serves.
 const ROUTE_DATA = {
-  // Quiet page: only noise, nothing alert-worthy.
-  '/': [
-    LISTINGS.resaleDecoy,
-    LISTINGS.hospitalityDecoy,
-    LISTINGS.wrongMatchDecoy
-  ],
-  // Drop page: the valid ticket buried among decoys.
+  '/': [LISTINGS.resaleDecoy, LISTINGS.hospitalityDecoy, LISTINGS.wrongMatchDecoy],
   '/drop': [
     LISTINGS.resaleDecoy,
     LISTINGS.hospitalityDecoy,
     LISTINGS.overpricedPrimaryDecoy,
+    LISTINGS.cat1OverCapDecoy,
     LISTINGS.validPrimary,
     LISTINGS.wrongMatchDecoy
   ]
 };
 
-/** Render a single listing as an HTML card. Attributes mirror the JSON keys so
- *  Cheerio selectors in app.js can read them directly. */
+// HTML escaping so listing data can't break out of attributes.
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 function renderCard(t) {
   return `
     <div class="ticket-listing"
-         data-listing-id="${t.id}"
-         data-match-id="${t.matchId}"
-         data-match-name="${t.matchName}"
-         data-category="${t.category}"
-         data-price="${t.price}"
-         data-currency="${t.currency}"
-         data-flags="${t.flags.join(',')}"
-         data-url="${t.url}">
-      <span class="match">Match ${t.matchId} — ${t.matchName}</span>
-      <span class="category">${t.category}</span>
-      <span class="price">${t.currency} ${t.price.toLocaleString()}</span>
-      <a class="buy" href="${t.url}">Buy</a>
+         data-listing-id="${esc(t.id)}"
+         data-match-id="${esc(t.matchId)}"
+         data-match-name="${esc(t.matchName)}"
+         data-sale-type="${esc(t.saleType)}"
+         data-category="${esc(t.category)}"
+         data-price="${esc(t.price)}"
+         data-currency="${esc(t.currency)}"
+         data-flags="${esc(t.flags.join(','))}"
+         data-url="${esc(t.url)}">
+      <span class="match">Match ${esc(t.matchId)} — ${esc(t.matchName)}</span>
+      <span class="sale-type">${esc(t.saleType)}</span>
+      <span class="category">${esc(t.category)}</span>
+      <span class="price">${esc(t.currency)} ${Number(t.price).toLocaleString()}</span>
+      <a class="buy" href="${esc(t.url)}">Buy</a>
     </div>`;
 }
 
-/** Wrap listing cards in a minimal page. */
 function renderPage(listings, route) {
   const cards = listings.map(renderCard).join('\n');
-  const banner =
-    route === '/drop'
-      ? '<p id="status">PRIMARY RETAIL DROP IN PROGRESS</p>'
-      : '<p id="status">No primary inventory currently available</p>';
+  const banner = route === '/drop'
+    ? '<p id="status">PRIMARY RETAIL DROP IN PROGRESS</p>'
+    : '<p id="status">No primary inventory currently available</p>';
   return `<!DOCTYPE html>
 <html lang="en">
   <head><meta charset="utf-8"><title>FIFA Tickets — Mock</title></head>
@@ -169,25 +179,31 @@ ${cards}
 </html>`;
 }
 
-/** Decide whether the caller wants JSON instead of HTML. */
 function wantsJson(req, parsedUrl) {
   if (parsedUrl.searchParams.get('format') === 'json') return true;
-  const accept = (req.headers.accept || '').toLowerCase();
-  return accept.includes('application/json');
+  return (req.headers.accept || '').toLowerCase().includes('application/json');
 }
 
 const server = http.createServer((req, res) => {
-  const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad request');
+    return;
+  }
   const route = parsedUrl.pathname;
 
-  // Checkout pages are just stubs so the email link resolves to *something*.
+  if (route === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', time: new Date().toISOString() }));
+    return;
+  }
+
   if (route.startsWith('/checkout/')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(
-      `<!DOCTYPE html><html><body><h1>Checkout</h1>` +
-        `<p>Mock manual checkout page for ${route}. ` +
-        `Hold expires in ~10–15 minutes.</p></body></html>`
-    );
+    res.end(`<!DOCTYPE html><html><body><h1>Checkout</h1><p>Mock manual checkout for ${esc(route)}. Hold expires in ~10–15 minutes.</p></body></html>`);
     return;
   }
 
@@ -199,23 +215,11 @@ const server = http.createServer((req, res) => {
   }
 
   if (wantsJson(req, parsedUrl)) {
-    // Structured API payload path.
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(
-      JSON.stringify(
-        {
-          match: '104',
-          generatedAt: new Date().toISOString(),
-          listings: data
-        },
-        null,
-        2
-      )
-    );
+    res.end(JSON.stringify({ match: '104', generatedAt: new Date().toISOString(), listings: data }, null, 2));
     return;
   }
 
-  // Default: HTML path for Cheerio.
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(renderPage(data, route));
 });
@@ -225,6 +229,17 @@ server.listen(PORT, () => {
   console.log(` Mock ticketing server listening on http://localhost:${PORT}`);
   console.log('   GET /          → quiet page (no alert-worthy tickets)');
   console.log('   GET /drop      → primary-retail drop (triggers an alert)');
-  console.log('   add ?format=json to either route for the JSON API path');
+  console.log('   GET /health    → liveness probe');
+  console.log('   add ?format=json to "/" or "/drop" for the JSON API path');
   console.log('────────────────────────────────────────────────────────────');
 });
+
+// Graceful shutdown so `npm run mock` exits cleanly under process managers.
+function close(signal) {
+  console.log(`\nReceived ${signal}; closing mock server.`);
+  server.close(() => process.exit(0));
+}
+process.on('SIGINT', () => close('SIGINT'));
+process.on('SIGTERM', () => close('SIGTERM'));
+
+module.exports = { server, LISTINGS, ROUTE_DATA };

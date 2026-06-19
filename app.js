@@ -1,18 +1,22 @@
 /**
  * app.js — FIFA Match 104 (The Final) primary-retail ticket monitor
  * -----------------------------------------------------------------------------
- * Pipeline per cycle:
- *   1. FETCH    the target URL with Axios (defaults to the local mock server).
- *   2. PARSE    the response: Cheerio for HTML, native JSON for API payloads.
- *   3. FILTER   every listing through strict purity + price rules.
- *   4. NOTIFY   via Nodemailer the instant a listing passes ALL rules.
+ * Pipeline per cycle:  FETCH (axios, with retry) -> PARSE (cheerio HTML or JSON
+ * API) -> FILTER (strict purity + official base-rate + budget rules) -> NOTIFY
+ * (nodemailer; console fallback when no SMTP creds).
  *
- * Design goals:
- *   - Fully testable OFFLINE. With no SMTP creds (or DRY_RUN=true) the email is
- *     rendered through Nodemailer's jsonTransport and printed to the console.
- *   - Idempotent alerts. A given listing only ever fires one email.
- *   - Run modes:  `node app.js`         -> long-running scheduler
- *                 `node app.js --once`  -> a single scan, then exit (for tests)
+ * Production characteristics:
+ *   - Fail-fast config validation at startup.
+ *   - Real FIFA 2026 Final base rates baked in (overridable via env).
+ *   - Fetch retries with exponential backoff; non-overlapping scheduler.
+ *   - Graceful shutdown (SIGINT/SIGTERM) and global error handlers.
+ *   - SMTP verified on boot; jsonTransport fallback keeps it testable offline.
+ *   - Idempotent alerts (a given listing fires at most once per process).
+ *   - Leveled logging via LOG_LEVEL.
+ *   - Pure functions exported for unit testing.
+ *
+ * Run modes:  `node app.js`        long-running scheduler
+ *             `node app.js --once`  single scan then exit (CI / smoke test)
  * -----------------------------------------------------------------------------
  */
 
@@ -23,33 +27,96 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const nodemailer = require('nodemailer');
 
-// ─── Configuration (env with safe defaults) ─────────────────────────────────
+// ─── Logging ────────────────────────────────────────────────────────────────
+const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+const ACTIVE_LEVEL = LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] || LEVELS.info;
+const ts = () => new Date().toISOString();
+function emit(level, ...a) {
+  if (LEVELS[level] < ACTIVE_LEVEL) return;
+  const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+  fn(`[${ts()}] [${level.toUpperCase()}]`, ...a);
+}
+const log = {
+  debug: (...a) => emit('debug', ...a),
+  info: (...a) => emit('info', ...a),
+  warn: (...a) => emit('warn', ...a),
+  error: (...a) => emit('error', ...a)
+};
+
+// ─── Config helpers ─────────────────────────────────────────────────────────
+function num(name, def) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return def;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : def;
+}
+function bool(name, def = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return def;
+  return String(raw).toLowerCase() === 'true';
+}
+
+/**
+ * Official FIFA World Cup 2026 Final (Match 104, MetLife Stadium) primary
+ * face-value base rates by category, in USD. Source: FIFA published primary
+ * pricing, June 2026. Category 1 / Front Category 1 are dynamically priced and
+ * excluded from the default budget-oriented set — add them via env if needed.
+ * Override wholesale with OFFICIAL_BASE_RATES as a JSON object.
+ */
+const DEFAULT_BASE_RATES = {
+  'Category 2': 4210,
+  'Category 3': 2790,
+  'Category 4': 2030
+};
+function parseBaseRates(raw) {
+  if (!raw) return null;
+  try {
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) return obj;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const CONFIG = {
   targetUrl: process.env.TARGET_URL || 'http://localhost:4040/',
   matchId: String(process.env.TARGET_MATCH_ID || '104').trim(),
   matchName: process.env.TARGET_MATCH_NAME || 'The Final',
-  priceCap: Number(process.env.PRICE_CAP || 4200),
-  primaryCategory: process.env.PRIMARY_CATEGORY || 'Primary / Standard Retail',
-  baseMin: Number(process.env.PRIMARY_BASE_MIN || 3800),
-  baseMax: Number(process.env.PRIMARY_BASE_MAX || 4200),
+
+  // Only this sale channel is "primary retail"; everything else is impure.
+  primarySaleType: (process.env.PRIMARY_SALE_TYPE || 'Primary').trim(),
+
+  // Budget ceiling applied to the FACE value (the listed ticket price).
+  priceCap: num('PRICE_CAP', 4300),
+
+  // Per-category official base rates and the allowed deviation around them.
+  baseRates: parseBaseRates(process.env.OFFICIAL_BASE_RATES) || DEFAULT_BASE_RATES,
+  deviationTolPct: num('DEVIATION_TOLERANCE_PCT', 0.05),
+
+  // FIFA's checkout service fee, informational (shown in the alert).
+  serviceFeePct: num('SERVICE_FEE_PCT', 0.15),
+
   currency: process.env.CURRENCY || 'USD',
-  fetchIntervalMs: Number(process.env.FETCH_INTERVAL_SECONDS || 60) * 1000,
-  summaryIntervalMs: Number(process.env.SUMMARY_INTERVAL_SECONDS || 600) * 1000,
+
+  fetchIntervalMs: num('FETCH_INTERVAL_SECONDS', 60) * 1000,
+  summaryIntervalMs: num('SUMMARY_INTERVAL_SECONDS', 600) * 1000,
+  fetchTimeoutMs: num('FETCH_TIMEOUT_SECONDS', 15) * 1000,
+  fetchRetries: num('FETCH_RETRIES', 3),
+
   smtp: {
     host: process.env.SMTP_HOST || '',
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+    port: num('SMTP_PORT', 587),
+    secure: bool('SMTP_SECURE', false),
     user: process.env.SMTP_USER || '',
     pass: process.env.SMTP_PASS || ''
   },
   alertFrom: process.env.ALERT_FROM || 'FIFA Ticket Monitor <monitor@example.com>',
   alertTo: process.env.ALERT_TO || 'you@example.com',
-  dryRun: String(process.env.DRY_RUN || 'false') === 'true'
+  dryRun: bool('DRY_RUN', false)
 };
 
-// Impurity markers. If a listing's category OR flags contain ANY of these
-// (case-insensitive substring match), it is NOT pure primary retail and is
-// discarded — no matter how attractive the price looks.
+// Impurity markers screened across saleType, category, and flags.
 const FORBIDDEN_MARKERS = [
   'resale',
   'verified fan resale',
@@ -57,82 +124,80 @@ const FORBIDDEN_MARKERS = [
   'vip',
   'package',
   'platinum',
-  'secondary'
+  'secondary',
+  'reseller'
 ];
 
-// Remembers listing IDs we've already alerted on, so we never double-send.
-const alertedListingIds = new Set();
+/** Validate config at startup and throw on anything that would silently break. */
+function validateConfig(cfg = CONFIG) {
+  const errors = [];
+  if (!/^https?:\/\//i.test(cfg.targetUrl)) errors.push(`TARGET_URL must be http(s): "${cfg.targetUrl}"`);
+  if (!cfg.matchId) errors.push('TARGET_MATCH_ID is required');
+  if (!(cfg.priceCap > 0)) errors.push(`PRICE_CAP must be > 0 (got ${cfg.priceCap})`);
+  if (!(cfg.deviationTolPct >= 0 && cfg.deviationTolPct < 1)) errors.push(`DEVIATION_TOLERANCE_PCT must be in [0,1) (got ${cfg.deviationTolPct})`);
+  if (!cfg.baseRates || Object.keys(cfg.baseRates).length === 0) errors.push('OFFICIAL_BASE_RATES is empty');
+  for (const [k, v] of Object.entries(cfg.baseRates || {})) {
+    if (!(Number(v) > 0)) errors.push(`base rate for "${k}" must be > 0 (got ${v})`);
+  }
+  if (!(cfg.fetchIntervalMs >= 1000)) errors.push('FETCH_INTERVAL_SECONDS must be >= 1');
+  if (!cfg.alertTo) errors.push('ALERT_TO is required');
+  // SMTP is all-or-nothing: either provide host+user+pass, or none (console mode).
+  const some = cfg.smtp.host || cfg.smtp.user || cfg.smtp.pass;
+  const all = cfg.smtp.host && cfg.smtp.user && cfg.smtp.pass;
+  if (some && !all) errors.push('Partial SMTP config: set SMTP_HOST, SMTP_USER and SMTP_PASS together (or none for console mode)');
+  if (errors.length) throw new Error('Invalid configuration:\n  - ' + errors.join('\n  - '));
+}
 
-// ─── Small helpers ──────────────────────────────────────────────────────────
-const ts = () => new Date().toISOString();
-const log = (...a) => console.log(`[${ts()}]`, ...a);
-
-/** Normalise a price that may arrive as "$4,150", "USD 4150" or a number. */
+// ─── Parsing helpers ────────────────────────────────────────────────────────
+/** Normalise a price that may arrive as "$4,210", "USD 4210", or a number. */
 function parsePrice(raw) {
   if (typeof raw === 'number') return raw;
   if (raw == null) return NaN;
-  // Strip everything that isn't a digit or a decimal point.
   const cleaned = String(raw).replace(/[^0-9.]/g, '');
   return cleaned === '' ? NaN : Number(cleaned);
 }
 
-/** True if `text` contains any forbidden impurity marker. */
+/** True if `text` contains any forbidden impurity marker (case-insensitive). */
 function hasForbiddenMarker(text) {
   const hay = String(text || '').toLowerCase();
   return FORBIDDEN_MARKERS.some((m) => hay.includes(m));
 }
 
-// ─── Step 2a: HTML parsing (Cheerio) ────────────────────────────────────────
-/**
- * Extract a normalised listing array from an HTML document.
- * Each `.ticket-listing` node carries its metadata in data-* attributes that
- * mirror the platform's DOM, so we read attributes rather than scraping text
- * (more robust against layout / whitespace changes).
- */
+/** Extract normalised listings from an HTML document via Cheerio. */
 function parseHtml(html) {
   const $ = cheerio.load(html);
   const listings = [];
-
   $('.ticket-listing').each((_, el) => {
     const node = $(el);
-    // Prefer the structured data-* attributes; fall back to visible text only
-    // if an attribute is missing, keeping the parser resilient.
     const flagsAttr = node.attr('data-flags') || '';
     listings.push({
-      id:
-        node.attr('data-listing-id') ||
-        node.find('.match').text().trim() ||
-        `html-${listings.length}`,
+      id: node.attr('data-listing-id') || `html-${listings.length}`,
       matchId: (node.attr('data-match-id') || '').trim(),
       matchName: (node.attr('data-match-name') || '').trim(),
-      category:
-        (node.attr('data-category') || node.find('.category').text()).trim(),
+      // Sale channel drives the purity check; fall back to visible text.
+      saleType: (node.attr('data-sale-type') || node.find('.sale-type').text() || '').trim(),
+      category: (node.attr('data-category') || node.find('.category').text() || '').trim(),
       price: parsePrice(node.attr('data-price') || node.find('.price').text()),
       currency: (node.attr('data-currency') || CONFIG.currency).trim(),
-      // Flags come as a comma-separated list in the attribute.
-      flags: flagsAttr
-        .split(',')
-        .map((f) => f.trim())
-        .filter(Boolean),
+      flags: flagsAttr.split(',').map((f) => f.trim()).filter(Boolean),
       url: node.attr('data-url') || node.find('a.buy').attr('href') || ''
     });
   });
-
   return listings;
 }
 
-// ─── Step 2b: JSON parsing (structured API) ─────────────────────────────────
 /** Normalise a structured JSON payload into the same listing shape. */
 function parseJson(payload) {
   const rows = Array.isArray(payload)
     ? payload
-    : Array.isArray(payload.listings)
+    : payload && Array.isArray(payload.listings)
     ? payload.listings
     : [];
   return rows.map((r, i) => ({
     id: r.id || `json-${i}`,
     matchId: String(r.matchId != null ? r.matchId : '').trim(),
     matchName: String(r.matchName || '').trim(),
+    saleType: String(r.saleType || '').trim(),
     category: String(r.category || '').trim(),
     price: parsePrice(r.price),
     currency: String(r.currency || CONFIG.currency).trim(),
@@ -141,106 +206,94 @@ function parseJson(payload) {
   }));
 }
 
-// ─── Step 3: the strict filter ──────────────────────────────────────────────
+// ─── The strict filter ──────────────────────────────────────────────────────
 /**
- * Decide whether a single normalised listing is a genuine, alert-worthy,
- * pure primary-retail seat for Match 104. Returns { pass, reason }.
- *
- * The checks are ordered cheapest-first and each documents WHY it rejects.
+ * Decide whether a normalised listing is a genuine, alert-worthy, pure
+ * primary-retail seat for the target match. Returns { pass, reason }.
+ * `cfg` is injectable so the rules are unit-testable in isolation.
  */
-function evaluate(listing) {
-  // (1) Right match? We only care about Match 104 — The Final.
-  if (listing.matchId !== CONFIG.matchId) {
-    return { pass: false, reason: `wrong match (${listing.matchId})` };
+function evaluate(listing, cfg = CONFIG) {
+  // (1) Right match — only Match 104 / The Final.
+  if (listing.matchId !== cfg.matchId) {
+    return { pass: false, reason: `wrong match (${listing.matchId || 'n/a'})` };
   }
-  if (
-    CONFIG.matchName &&
-    !listing.matchName.toLowerCase().includes(CONFIG.matchName.toLowerCase())
-  ) {
+  if (cfg.matchName && !listing.matchName.toLowerCase().includes(cfg.matchName.toLowerCase())) {
     return { pass: false, reason: `match name mismatch (${listing.matchName})` };
   }
 
-  // (2) Purity — category must be EXACTLY the official primary category.
-  //     Any other category (Hospitality, etc.) is rejected here.
-  if (
-    listing.category.toLowerCase() !== CONFIG.primaryCategory.toLowerCase()
-  ) {
-    return { pass: false, reason: `non-primary category (${listing.category})` };
+  // (2) Purity — sale channel must be exactly the primary type.
+  if (listing.saleType.toLowerCase() !== cfg.primarySaleType.toLowerCase()) {
+    return { pass: false, reason: `non-primary sale type (${listing.saleType || 'n/a'})` };
   }
 
-  // (3) Purity — no impurity markers in the category text or the flags list.
-  //     This catches "resale", "verified fan resale", "hospitality", etc. even
-  //     when a seller tries to label a resale as "Primary".
-  const flagText = listing.flags.join(' ');
-  if (hasForbiddenMarker(listing.category) || hasForbiddenMarker(flagText)) {
-    return {
-      pass: false,
-      reason: `impurity flag present (${listing.flags.join(',') || 'category'})`
-    };
+  // (3) Purity — no impurity markers anywhere (catches resale/hospitality even
+  //     if a seller tries to relabel them as "Primary").
+  const haystack = `${listing.saleType} ${listing.category} ${listing.flags.join(' ')}`;
+  if (hasForbiddenMarker(haystack)) {
+    return { pass: false, reason: `impurity marker present (${listing.flags.join(',') || listing.category})` };
   }
 
-  // (4) Price sanity — must be a real number.
+  // (4) Category must be a known official primary tier.
+  const baseRate = cfg.baseRates[listing.category];
+  if (!(Number(baseRate) > 0)) {
+    return { pass: false, reason: `unknown / unpriced category (${listing.category || 'n/a'})` };
+  }
+
+  // (5) Price must parse.
   if (!Number.isFinite(listing.price)) {
     return { pass: false, reason: 'unparseable price' };
   }
 
-  // (5) Hard price cap.
-  if (listing.price > CONFIG.priceCap) {
-    return { pass: false, reason: `over price cap (${listing.price})` };
+  // (6) Budget cap on face value.
+  if (listing.price > cfg.priceCap) {
+    return { pass: false, reason: `over budget cap (${listing.price} > ${cfg.priceCap})` };
   }
 
-  // (6) Base-rate deviation — a *genuine* primary seat sits inside the official
-  //     base band. A "primary" listing priced below/above the band is almost
-  //     certainly a mis-flagged resale or data error, so discard it.
-  if (listing.price < CONFIG.baseMin || listing.price > CONFIG.baseMax) {
+  // (7) Base-rate deviation — a genuine primary seat sits within tolerance of
+  //     its category's official face value. Anything outside is treated as a
+  //     mis-flagged resale / data error and discarded.
+  const lo = baseRate * (1 - cfg.deviationTolPct);
+  const hi = baseRate * (1 + cfg.deviationTolPct);
+  if (listing.price < lo || listing.price > hi) {
     return {
       pass: false,
-      reason: `price deviates from official base band (${listing.price} not in ${CONFIG.baseMin}-${CONFIG.baseMax})`
+      reason: `price deviates from official ${listing.category} base ${baseRate} (allowed ${Math.round(lo)}-${Math.round(hi)})`
     };
   }
 
-  // Survived every rule → genuine primary retail seat.
-  return { pass: true, reason: 'pure primary retail — all rules passed' };
+  return { pass: true, reason: `pure primary retail (${listing.category} @ base ${baseRate})`, baseRate };
 }
 
-// ─── Notification layer (Nodemailer) ────────────────────────────────────────
-let transporterPromise = null;
+// ─── Notification layer ─────────────────────────────────────────────────────
+let transporter = null;
 
-/**
- * Build (once) a Nodemailer transporter. If SMTP creds are missing or DRY_RUN
- * is set, we use jsonTransport so the message is serialised and printed rather
- * than sent — keeping the whole app testable with no live SMTP server.
- */
-function getTransporter() {
-  if (transporterPromise) return transporterPromise;
-
+/** Build (once) and verify a Nodemailer transporter. */
+async function initTransporter() {
   const haveSmtp = CONFIG.smtp.host && CONFIG.smtp.user && CONFIG.smtp.pass;
   if (CONFIG.dryRun || !haveSmtp) {
-    log(
-      'Email mode: CONSOLE (jsonTransport).',
-      CONFIG.dryRun ? 'DRY_RUN=true.' : 'No SMTP credentials configured.'
-    );
-    transporterPromise = Promise.resolve(
-      nodemailer.createTransport({ jsonTransport: true })
-    );
-  } else {
-    log(`Email mode: SMTP via ${CONFIG.smtp.host}:${CONFIG.smtp.port}`);
-    transporterPromise = Promise.resolve(
-      nodemailer.createTransport({
-        host: CONFIG.smtp.host,
-        port: CONFIG.smtp.port,
-        secure: CONFIG.smtp.secure,
-        auth: { user: CONFIG.smtp.user, pass: CONFIG.smtp.pass }
-      })
-    );
+    log.info(`Email mode: CONSOLE (jsonTransport). ${CONFIG.dryRun ? 'DRY_RUN=true.' : 'No SMTP credentials configured.'}`);
+    transporter = nodemailer.createTransport({ jsonTransport: true });
+    return;
   }
-  return transporterPromise;
+  log.info(`Email mode: SMTP ${CONFIG.smtp.host}:${CONFIG.smtp.port} (secure=${CONFIG.smtp.secure})`);
+  transporter = nodemailer.createTransport({
+    host: CONFIG.smtp.host,
+    port: CONFIG.smtp.port,
+    secure: CONFIG.smtp.secure,
+    auth: { user: CONFIG.smtp.user, pass: CONFIG.smtp.pass }
+  });
+  // Fail fast if credentials/host are wrong rather than at first alert.
+  await transporter.verify();
+  log.info('SMTP connection verified.');
 }
 
 /** Compose and dispatch the alert email for a passing listing. */
 async function sendAlert(listing) {
-  const priceStr = `${listing.currency} ${listing.price.toLocaleString()}`;
-  const subject = `🎟️ PRIMARY RETAIL DROP — Match ${listing.matchId} ${CONFIG.matchName} @ ${priceStr}`;
+  const face = listing.price;
+  const total = Math.round(face * (1 + CONFIG.serviceFeePct));
+  const priceStr = `${listing.currency} ${face.toLocaleString()}`;
+  const totalStr = `${listing.currency} ${total.toLocaleString()}`;
+  const subject = `🎟️ PRIMARY RETAIL DROP — Match ${listing.matchId} ${CONFIG.matchName} (${listing.category}) @ ${priceStr}`;
 
   const instruction =
     'Action required: Ticket holds on official platforms typically expire ' +
@@ -248,12 +301,11 @@ async function sendAlert(listing) {
     'to secure your manual checkout seat.';
 
   const text = [
-    `A genuine PRIMARY / STANDARD RETAIL ticket for Match ${listing.matchId} ` +
-      `(${listing.matchName}) just passed every filter.`,
+    `A genuine PRIMARY / STANDARD RETAIL ticket for Match ${listing.matchId} (${listing.matchName}) just passed every filter.`,
     '',
     `Match:           Match ${listing.matchId} — ${listing.matchName}`,
-    `Category:        ${listing.category}`,
-    `Verified price:  ${priceStr} (official primary base band ${CONFIG.baseMin}-${CONFIG.baseMax})`,
+    `Category:        ${listing.category} (sale type: ${listing.saleType})`,
+    `Verified price:  ${priceStr} face  (~${totalStr} incl. ${Math.round(CONFIG.serviceFeePct * 100)}% service fee)`,
     `Listing ID:      ${listing.id}`,
     `Purchase link:   ${listing.url}`,
     '',
@@ -265,150 +317,186 @@ async function sendAlert(listing) {
     <table cellpadding="6" style="border-collapse:collapse">
       <tr><td><b>Match</b></td><td>Match ${listing.matchId} — ${listing.matchName}</td></tr>
       <tr><td><b>Category</b></td><td>${listing.category}</td></tr>
-      <tr><td><b>Verified primary price</b></td><td>${priceStr}</td></tr>
-      <tr><td><b>Official base band</b></td><td>${CONFIG.currency} ${CONFIG.baseMin.toLocaleString()} – ${CONFIG.baseMax.toLocaleString()}</td></tr>
+      <tr><td><b>Sale type</b></td><td>${listing.saleType}</td></tr>
+      <tr><td><b>Verified primary price</b></td><td>${priceStr} face</td></tr>
+      <tr><td><b>Est. total incl. ${Math.round(CONFIG.serviceFeePct * 100)}% fee</b></td><td>${totalStr}</td></tr>
       <tr><td><b>Listing ID</b></td><td>${listing.id}</td></tr>
     </table>
-    <p><a href="${listing.url}"
-          style="display:inline-block;padding:12px 20px;background:#0a7d2c;color:#fff;text-decoration:none;border-radius:6px">
-       ➜ Go directly to the purchase page
-    </a></p>
+    <p><a href="${listing.url}" style="display:inline-block;padding:12px 20px;background:#0a7d2c;color:#fff;text-decoration:none;border-radius:6px">➜ Go directly to the purchase page</a></p>
     <p style="color:#b00020;font-weight:bold">${instruction}</p>
   `;
 
-  const transporter = await getTransporter();
-  const info = await transporter.sendMail({
-    from: CONFIG.alertFrom,
-    to: CONFIG.alertTo,
-    subject,
-    text,
-    html
-  });
-
-  // jsonTransport returns the serialised message on `info.message`.
+  const info = await transporter.sendMail({ from: CONFIG.alertFrom, to: CONFIG.alertTo, subject, text, html });
   if (info && info.message) {
-    log('ALERT email (console mode) ↓');
+    log.info('ALERT email (console mode) ↓');
     console.log(info.message.toString());
   } else {
-    log(`ALERT email sent → ${CONFIG.alertTo} (messageId: ${info.messageId})`);
+    log.info(`ALERT email sent → ${CONFIG.alertTo} (messageId: ${info.messageId})`);
   }
 }
 
-// ─── Step 1 + orchestration: one monitoring cycle ───────────────────────────
+// ─── Fetch with retry/backoff ───────────────────────────────────────────────
+async function fetchTarget() {
+  let lastErr;
+  for (let attempt = 0; attempt <= CONFIG.fetchRetries; attempt++) {
+    try {
+      const res = await axios.get(CONFIG.targetUrl, {
+        timeout: CONFIG.fetchTimeoutMs,
+        headers: { Accept: 'text/html, application/json' },
+        validateStatus: (s) => s >= 200 && s < 500
+      });
+      if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < CONFIG.fetchRetries) {
+        const backoff = 1000 * Math.pow(2, attempt);
+        log.warn(`Fetch attempt ${attempt + 1} failed (${err.message}); retrying in ${backoff}ms`);
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ─── Orchestration ──────────────────────────────────────────────────────────
+const alertedListingIds = new Set();
 let lastSummaryAt = 0;
 let lastCycleHadPrimary = false;
+let cycleInFlight = false;
 
-/** Fetch, parse, filter, and (if warranted) alert. Returns # of passing seats. */
+/** One full cycle. Returns the number of passing seats. */
 async function runCycle() {
-  let response;
+  if (cycleInFlight) {
+    log.debug('Previous cycle still running; skipping this tick.');
+    return 0;
+  }
+  cycleInFlight = true;
   try {
-    response = await axios.get(CONFIG.targetUrl, {
-      timeout: 15000,
-      // Accept both content types; we branch on the response header below.
-      headers: { Accept: 'text/html, application/json' },
-      // We want to read 4xx bodies too rather than throw immediately.
-      validateStatus: (s) => s >= 200 && s < 500
-    });
-  } catch (err) {
-    log(`FETCH error: ${err.message}`);
-    return 0;
-  }
-
-  if (response.status !== 200) {
-    log(`Non-200 from target (${response.status}); skipping cycle.`);
-    return 0;
-  }
-
-  // Branch on content type: JSON API vs HTML page.
-  const contentType = String(response.headers['content-type'] || '');
-  let listings;
-  if (contentType.includes('application/json')) {
-    listings = parseJson(response.data);
-  } else {
-    // Axios may have already parsed JSON into an object; coerce to string only
-    // when we genuinely have HTML markup.
-    const body =
-      typeof response.data === 'string'
-        ? response.data
-        : String(response.data);
-    listings = parseHtml(body);
-  }
-
-  // Evaluate every listing; collect the winners.
-  const passing = [];
-  for (const listing of listings) {
-    const verdict = evaluate(listing);
-    if (verdict.pass) {
-      passing.push(listing);
-    } else {
-      // Verbose per-listing rejection logging helps demonstrate the filters.
-      log(`  ✗ rejected ${listing.id}: ${verdict.reason}`);
-    }
-  }
-
-  lastCycleHadPrimary = passing.length > 0;
-
-  for (const listing of passing) {
-    if (alertedListingIds.has(listing.id)) {
-      log(`  • already alerted on ${listing.id}; skipping duplicate.`);
-      continue;
-    }
-    log(`  ✓ MATCH ${listing.id}: ${CONFIG.matchName} @ ${listing.currency} ${listing.price}`);
+    let response;
     try {
-      await sendAlert(listing);
-      alertedListingIds.add(listing.id);
+      response = await fetchTarget();
     } catch (err) {
-      log(`  ! failed to send alert for ${listing.id}: ${err.message}`);
+      log.error(`FETCH failed after retries: ${err.message}`);
+      return 0;
     }
-  }
 
-  return passing.length;
+    const contentType = String(response.headers['content-type'] || '');
+    let listings;
+    if (contentType.includes('application/json')) {
+      listings = parseJson(response.data);
+    } else {
+      const body = typeof response.data === 'string' ? response.data : String(response.data);
+      listings = parseHtml(body);
+    }
+    log.debug(`Parsed ${listings.length} listing(s) from ${contentType.includes('json') ? 'JSON' : 'HTML'}`);
+
+    const passing = [];
+    for (const listing of listings) {
+      const verdict = evaluate(listing);
+      if (verdict.pass) passing.push(listing);
+      else log.debug(`  ✗ ${listing.id}: ${verdict.reason}`);
+    }
+    lastCycleHadPrimary = passing.length > 0;
+
+    for (const listing of passing) {
+      if (alertedListingIds.has(listing.id)) {
+        log.debug(`  • already alerted on ${listing.id}; skipping.`);
+        continue;
+      }
+      log.info(`  ✓ MATCH ${listing.id}: ${CONFIG.matchName} ${listing.category} @ ${listing.currency} ${listing.price}`);
+      try {
+        await sendAlert(listing);
+        alertedListingIds.add(listing.id);
+      } catch (err) {
+        log.error(`  ! failed to send alert for ${listing.id}: ${err.message}`);
+      }
+    }
+    return passing.length;
+  } finally {
+    cycleInFlight = false;
+  }
 }
 
-/** Emit the heartbeat summary at most once per SUMMARY_INTERVAL. */
+/** Heartbeat summary, throttled to SUMMARY_INTERVAL. */
 function maybePrintSummary(force = false) {
   const now = Date.now();
   if (!force && now - lastSummaryAt < CONFIG.summaryIntervalMs) return;
   lastSummaryAt = now;
   const status = lastCycleHadPrimary ? 'Active' : 'No Primary Seats Found';
-  console.log(
-    `Monitoring active for Match ${CONFIG.matchId}. ` +
-      `Current Status: [${status}]. Time: [${ts()}].`
-  );
+  console.log(`Monitoring active for Match ${CONFIG.matchId}. Current Status: [${status}]. Time: [${ts()}].`);
 }
 
-// ─── Bootstrap ──────────────────────────────────────────────────────────────
+// ─── Scheduler + lifecycle ──────────────────────────────────────────────────
+let timer = null;
+let shuttingDown = false;
+
+async function loop() {
+  if (shuttingDown) return;
+  await runCycle();
+  maybePrintSummary();
+  if (!shuttingDown) timer = setTimeout(loop, CONFIG.fetchIntervalMs);
+}
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.info(`Received ${signal}; shutting down gracefully.`);
+  if (timer) clearTimeout(timer);
+  if (transporter && typeof transporter.close === 'function') transporter.close();
+  process.exit(0);
+}
+
 async function main() {
   const once = process.argv.includes('--once');
 
-  log('FIFA Ticket Monitor starting.');
-  log(`Target:   ${CONFIG.targetUrl}`);
-  log(`Match:    ${CONFIG.matchId} — ${CONFIG.matchName}`);
-  log(`Rules:    category="${CONFIG.primaryCategory}", cap=${CONFIG.currency} ${CONFIG.priceCap}, base band ${CONFIG.baseMin}-${CONFIG.baseMax}`);
-  log(`Interval: ${CONFIG.fetchIntervalMs / 1000}s, summary every ${CONFIG.summaryIntervalMs / 1000}s`);
+  validateConfig();
+  log.info('FIFA Ticket Monitor starting.');
+  log.info(`Target:   ${CONFIG.targetUrl}`);
+  log.info(`Match:    ${CONFIG.matchId} — ${CONFIG.matchName}`);
+  log.info(`Rules:    saleType="${CONFIG.primarySaleType}", cap=${CONFIG.currency} ${CONFIG.priceCap}, tol=±${CONFIG.deviationTolPct * 100}%`);
+  log.info(`Base rates: ${JSON.stringify(CONFIG.baseRates)}`);
+  log.info(`Interval: ${CONFIG.fetchIntervalMs / 1000}s, summary every ${CONFIG.summaryIntervalMs / 1000}s`);
 
-  // Run an immediate first cycle so we don't wait a full interval.
-  const hits = await runCycle();
-  maybePrintSummary(true); // always print one summary on startup
+  await initTransporter();
 
   if (once) {
-    log(`Single-run complete. Passing primary seats this scan: ${hits}.`);
+    const hits = await runCycle();
+    maybePrintSummary(true);
+    log.info(`Single-run complete. Passing primary seats this scan: ${hits}.`);
     process.exit(0);
   }
 
-  // Long-running scheduler.
-  setInterval(async () => {
-    await runCycle();
-    maybePrintSummary();
-  }, CONFIG.fetchIntervalMs);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // First cycle immediately, then self-scheduling (overlap-safe) loop.
+  await runCycle();
+  maybePrintSummary(true);
+  timer = setTimeout(loop, CONFIG.fetchIntervalMs);
 }
 
-// Exported for unit testing of the pure pieces; run main() when invoked directly.
-module.exports = { evaluate, parseHtml, parseJson, parsePrice, hasForbiddenMarker };
+// Never crash silently on an unexpected async error.
+process.on('unhandledRejection', (reason) => log.error(`Unhandled rejection: ${reason && reason.stack ? reason.stack : reason}`));
+process.on('uncaughtException', (err) => {
+  log.error(`Uncaught exception: ${err.stack || err.message}`);
+  process.exit(1);
+});
+
+module.exports = {
+  evaluate,
+  parseHtml,
+  parseJson,
+  parsePrice,
+  hasForbiddenMarker,
+  validateConfig,
+  DEFAULT_BASE_RATES,
+  CONFIG
+};
 
 if (require.main === module) {
   main().catch((err) => {
-    log(`Fatal: ${err.stack || err.message}`);
+    log.error(`Fatal: ${err.stack || err.message}`);
     process.exit(1);
   });
 }
