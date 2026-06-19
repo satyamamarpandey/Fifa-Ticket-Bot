@@ -90,6 +90,14 @@ const CONFIG = {
   // Budget ceiling applied to the FACE value (the listed ticket price).
   priceCap: num('PRICE_CAP', 4300),
 
+  // "Notify when the price comes around X" mode. When TARGET_PRICE > 0 the
+  // engine alerts on any PRIMARY listing whose price falls within
+  // ±TARGET_PRICE_TOLERANCE_PCT of the target, regardless of category — this
+  // is the simple "ping me near $2,000" behaviour. When 0 (default) the engine
+  // uses the per-category base-rate + budget-cap rules instead.
+  targetPrice: num('TARGET_PRICE', 0),
+  targetPriceTolPct: num('TARGET_PRICE_TOLERANCE_PCT', 0.1),
+
   // Per-category official base rates and the allowed deviation around them.
   baseRates: parseBaseRates(process.env.OFFICIAL_BASE_RATES) || DEFAULT_BASE_RATES,
   deviationTolPct: num('DEVIATION_TOLERANCE_PCT', 0.05),
@@ -233,15 +241,31 @@ function evaluate(listing, cfg = CONFIG) {
     return { pass: false, reason: `impurity marker present (${listing.flags.join(',') || listing.category})` };
   }
 
-  // (4) Category must be a known official primary tier.
+  // (4) Price must parse.
+  if (!Number.isFinite(listing.price)) {
+    return { pass: false, reason: 'unparseable price' };
+  }
+
+  // ── TARGET-PRICE MODE ──────────────────────────────────────────────────
+  // "Ping me when the price comes around $X." A pure primary listing passes
+  // if its price lands within ±tolerance of TARGET_PRICE, regardless of tier.
+  if (cfg.targetPrice > 0) {
+    const lo = cfg.targetPrice * (1 - cfg.targetPriceTolPct);
+    const hi = cfg.targetPrice * (1 + cfg.targetPriceTolPct);
+    if (listing.price < lo || listing.price > hi) {
+      return {
+        pass: false,
+        reason: `price ${listing.price} not near target ${cfg.targetPrice} (window ${Math.round(lo)}-${Math.round(hi)})`
+      };
+    }
+    return { pass: true, reason: `pure primary near target ${cfg.targetPrice} (${listing.category} @ ${listing.price})` };
+  }
+
+  // ── CATEGORY / BUDGET MODE (default) ───────────────────────────────────
+  // (5) Category must be a known official primary tier.
   const baseRate = cfg.baseRates[listing.category];
   if (!(Number(baseRate) > 0)) {
     return { pass: false, reason: `unknown / unpriced category (${listing.category || 'n/a'})` };
-  }
-
-  // (5) Price must parse.
-  if (!Number.isFinite(listing.price)) {
-    return { pass: false, reason: 'unparseable price' };
   }
 
   // (6) Budget cap on face value.
@@ -454,8 +478,14 @@ async function main() {
   log.info('FIFA Ticket Monitor starting.');
   log.info(`Target:   ${CONFIG.targetUrl}`);
   log.info(`Match:    ${CONFIG.matchId} — ${CONFIG.matchName}`);
-  log.info(`Rules:    saleType="${CONFIG.primarySaleType}", cap=${CONFIG.currency} ${CONFIG.priceCap}, tol=±${CONFIG.deviationTolPct * 100}%`);
-  log.info(`Base rates: ${JSON.stringify(CONFIG.baseRates)}`);
+  if (CONFIG.targetPrice > 0) {
+    const lo = Math.round(CONFIG.targetPrice * (1 - CONFIG.targetPriceTolPct));
+    const hi = Math.round(CONFIG.targetPrice * (1 + CONFIG.targetPriceTolPct));
+    log.info(`Mode:     TARGET-PRICE — alert on primary listings near ${CONFIG.currency} ${CONFIG.targetPrice} (window ${lo}-${hi})`);
+  } else {
+    log.info(`Mode:     CATEGORY/BUDGET — saleType="${CONFIG.primarySaleType}", cap=${CONFIG.currency} ${CONFIG.priceCap}, tol=±${CONFIG.deviationTolPct * 100}%`);
+    log.info(`Base rates: ${JSON.stringify(CONFIG.baseRates)}`);
+  }
   log.info(`Interval: ${CONFIG.fetchIntervalMs / 1000}s, summary every ${CONFIG.summaryIntervalMs / 1000}s`);
 
   await initTransporter();

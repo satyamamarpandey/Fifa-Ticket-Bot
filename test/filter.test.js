@@ -120,6 +120,16 @@ test('parseJson normalises a structured payload', () => {
   assert.equal(evaluate(l, CFG).pass, true);
 });
 
+test('target-price mode: alerts on a primary seat near the target', () => {
+  const cfg = { ...CFG, targetPrice: 2000, targetPriceTolPct: 0.1 };
+  // Cat 4 at $2,030 is within $1,800-$2,200 -> pass.
+  assert.equal(evaluate({ ...valid, category: 'Category 4', price: 2030 }, cfg).pass, true);
+  // Cat 2 at $4,210 is far from $2,000 -> reject.
+  assert.equal(evaluate({ ...valid, price: 4210 }, cfg).pass, false);
+  // Resale near $2,000 is still rejected on sale type.
+  assert.equal(evaluate({ ...valid, price: 2000, saleType: 'Verified Fan Resale', flags: ['resale'] }, cfg).pass, false);
+});
+
 test('validateConfig rejects a bad target URL', () => {
   assert.throws(() => validateConfig({ ...CFG, targetUrl: 'ftp://nope', fetchIntervalMs: 60000, alertTo: 'a@b.c', smtp: {} }), /TARGET_URL/);
 });

@@ -95,6 +95,21 @@ const LISTINGS = {
     label: 'Match 104 — The Final · "Primary" Cat 2 (suspicious price)'
   },
 
+  // Legit primary Category 4 near $2,000 — the "around 2000" target. Passes in
+  // both category/budget mode and target-price mode.
+  cat4Primary: {
+    id: 'L-CAT4-104',
+    matchId: '104',
+    matchName: 'The Final',
+    saleType: 'Primary',
+    category: 'Category 4',
+    price: 2030, // official Cat 4 face value
+    currency: 'USD',
+    flags: [],
+    url: `http://localhost:${PORT}/checkout/match104-final-cat4-B22`,
+    label: 'Match 104 — The Final · Category 4 (Primary, ~$2,000)'
+  },
+
   // Legit primary Cat 1 but above the budget cap -> rejected by cap.
   cat1OverCapDecoy: {
     id: 'L-CAT1-104',
@@ -132,6 +147,7 @@ const ROUTE_DATA = {
     LISTINGS.overpricedPrimaryDecoy,
     LISTINGS.cat1OverCapDecoy,
     LISTINGS.validPrimary,
+    LISTINGS.cat4Primary,
     LISTINGS.wrongMatchDecoy
   ]
 };
